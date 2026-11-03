@@ -134,8 +134,10 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
     },
   });
 
-  const responseText = await upstream.text();
+  const responseBuffer = await upstream.arrayBuffer();
+const responseText = new TextDecoder("utf-8").decode(responseBuffer);
   const headers = createCorsHeaders(upstream.headers);
+headers.set("Content-Type", "application/json; charset=utf-8");
   if (!headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json; charset=utf-8");
   }
