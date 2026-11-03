@@ -1,8 +1,23 @@
 const DEFAULT_API_BASE_URL = "https://music-api.gdstudio.xyz/api.php";
 const KUWO_HOST_PATTERN = /(^|\.)kuwo\.cn$/i;
-const SAFE_RESPONSE_HEADERS = ["content-type", "cache-control", "accept-ranges", "content-length", "content-range", "etag", "last-modified", "expires"];
+const SAFE_RESPONSE_HEADERS = [
+  "content-type",
+  "cache-control",
+  "accept-ranges",
+  "content-length",
+  "content-range",
+  "etag",
+  "last-modified",
+  "expires",
+];
 
-function createCorsHeaders(init?: Headers): Headers {
+type ProxyContext = {
+  request: Request;
+  waitUntil?: (promise: Promise<any>) => void;
+  apiBaseUrl: string;
+};
+
+function createCorsHeaders(init?: Headers, defaultCacheControl = "no-store"): Headers {
   const headers = new Headers();
   if (init) {
     for (const [key, value] of init.entries()) {
@@ -12,10 +27,23 @@ function createCorsHeaders(init?: Headers): Headers {
     }
   }
   if (!headers.has("Cache-Control")) {
-    headers.set("Cache-Control", "no-store");
+    headers.set("Cache-Control", defaultCacheControl);
   }
   headers.set("Access-Control-Allow-Origin", "*");
   return headers;
+}
+
+function jsonResponse(
+  payload: Record<string, unknown>,
+  status = 502,
+  extraHeaders?: Headers,
+): Response {
+  const headers = createCorsHeaders(extraHeaders, "no-store");
+  headers.set("Content-Type", "application/json; charset=utf-8");
+  headers.set("Cache-Control", "no-store, no-cache, must-revalidate");
+  headers.set("X-Cache-Status", "BYPASS");
+  headers.set("Access-Control-Expose-Headers", "X-Cache-Status");
+  return new Response(JSON.stringify(payload), { status, headers });
 }
 
 function handleOptions(): Response {
@@ -31,19 +59,14 @@ function handleOptions(): Response {
 }
 
 function isAllowedKuwoHost(hostname: string): boolean {
-  if (!hostname) return false;
-  return KUWO_HOST_PATTERN.test(hostname);
+  return !!hostname && KUWO_HOST_PATTERN.test(hostname);
 }
 
 function normalizeKuwoUrl(rawUrl: string): URL | null {
   try {
     const parsed = new URL(rawUrl);
-    if (!isAllowedKuwoHost(parsed.hostname)) {
-      return null;
-    }
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      return null;
-    }
+    if (!isAllowedKuwoHost(parsed.hostname)) return null;
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
     parsed.protocol = "http:";
     return parsed;
   } catch {
@@ -54,147 +77,220 @@ function normalizeKuwoUrl(rawUrl: string): URL | null {
 async function proxyKuwoAudio(targetUrl: string, request: Request): Promise<Response> {
   const normalized = normalizeKuwoUrl(targetUrl);
   if (!normalized) {
-    return new Response("Invalid target", { status: 400 });
+    return new Response("Invalid target", {
+      status: 400,
+      headers: createCorsHeaders(undefined, "no-store"),
+    });
   }
 
-  const init: RequestInit = {
-    method: request.method,
-    headers: {
-      "User-Agent": request.headers.get("User-Agent") ?? "Mozilla/5.0",
-      "Referer": "https://www.kuwo.cn/",
-    },
-  };
-
+  const headers = new Headers({
+    "User-Agent": request.headers.get("User-Agent") ?? "Mozilla/5.0",
+    "Referer": "https://www.kuwo.cn/",
+  });
   const rangeHeader = request.headers.get("Range");
-  if (rangeHeader) {
-    (init.headers as Record<string, string>)["Range"] = rangeHeader;
+  if (rangeHeader) headers.set("Range", rangeHeader);
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(normalized.toString(), {
+      method: request.method === "HEAD" ? "HEAD" : "GET",
+      headers,
+    });
+  } catch (error) {
+    console.error("[Kuwo Proxy Error]", error);
+    return jsonResponse({ error: "kuwo_upstream_unavailable" }, 502);
   }
 
-  const upstream = await fetch(normalized.toString(), init);
-  const headers = createCorsHeaders(upstream.headers);
-  if (!headers.has("Cache-Control")) {
-    headers.set("Cache-Control", "public, max-age=3600");
-  }
-
-  return new Response(upstream.body, {
+  const responseHeaders = createCorsHeaders(upstream.headers, "public, max-age=3600");
+  return new Response(request.method === "HEAD" ? null : upstream.body, {
     status: upstream.status,
     statusText: upstream.statusText,
+    headers: responseHeaders,
+  });
+}
+
+function parseApiJson(text: string): { valid: boolean; value?: unknown; reason?: string } {
+  if (!text || !text.trim()) return { valid: false, reason: "empty_response" };
+
+  try {
+    const value: unknown = JSON.parse(text);
+    if (typeof value === "string" && /^error(?:\b|\s|:)/i.test(value.trim())) {
+      return { valid: false, reason: "upstream_text_error" };
+    }
+    if (value === null || value === undefined) {
+      return { valid: false, reason: "empty_json_value" };
+    }
+    if (typeof value === "object" && !Array.isArray(value)) {
+      const record = value as Record<string, unknown>;
+      if (record.error) return { valid: false, reason: "upstream_error_field" };
+      if (record.status === 0 || record.status === "0") {
+        return { valid: false, reason: "upstream_error_status" };
+      }
+    }
+    return { valid: true, value };
+  } catch {
+    return { valid: false, reason: "invalid_json" };
+  }
+}
+
+function addCacheStatus(response: Response, status: string): Response {
+  const headers = new Headers(response.headers);
+  headers.set("X-Cache-Status", status);
+  headers.set("Access-Control-Expose-Headers", "X-Cache-Status");
+  headers.set("Access-Control-Allow-Origin", "*");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
     headers,
   });
 }
 
-async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise: Promise<any>) => void, apiBaseUrl: string = DEFAULT_API_BASE_URL): Promise<Response> {
-  const cache = caches.default;
-  
-  // 构建缓存 Key（过滤掉随机签名 s 以及强制刷新标记 nocache，以便重试成功后能更新同一个缓存项）
+async function proxyApiRequest({ request, waitUntil, apiBaseUrl }: ProxyContext, url: URL): Promise<Response> {
+  const cache = (caches as unknown as { default: Cache }).default;
+  const isGet = request.method === "GET";
+  const bypassCache = url.searchParams.get("nocache") === "true";
+
+  // s 和 nocache 不参与缓存键，避免随机签名制造重复缓存。
   const cacheUrl = new URL(url.toString());
   cacheUrl.searchParams.delete("s");
   cacheUrl.searchParams.delete("nocache");
-  
-  const cacheKey = new Request(cacheUrl.toString(), {
-    method: request.method,
-    headers: request.headers
-  });
+  const cacheKey = new Request(cacheUrl.toString(), { method: "GET" });
 
-  // 如果是 GET 请求且未指定 nocache 强制刷新，尝试命中缓存
-  const bypassCache = url.searchParams.get("nocache") === "true";
-  if (request.method === "GET" && !bypassCache) {
+  // 旧版本可能缓存过裸文本 error。命中缓存后必须先验证，不能盲信历史垃圾数据。
+  if (isGet && !bypassCache) {
     try {
       const cachedResponse = await cache.match(cacheKey);
       if (cachedResponse) {
-        console.log(`[Cache HIT] ${url.toString()}`);
-        const response = new Response(cachedResponse.body, cachedResponse);
-        response.headers.set("X-Cache-Status", "HIT");
-        response.headers.set("Access-Control-Expose-Headers", "X-Cache-Status");
-        return response;
+        const cachedText = await cachedResponse.clone().text();
+        const cachedJson = parseApiJson(cachedText);
+        if (cachedResponse.status === 200 && cachedJson.valid) {
+          console.log(`[Cache HIT] ${url.toString()}`);
+          return addCacheStatus(cachedResponse, "HIT");
+        }
+
+        console.warn(`[Cache INVALID] Removing stale cache: ${url.toString()}`);
+        await cache.delete(cacheKey);
       }
-    } catch (err) {
-      console.warn(`[Cache ERROR] ${url.toString()}`, err);
+    } catch (error) {
+      console.warn(`[Cache READ ERROR] ${url.toString()}`, error);
     }
   }
 
-  console.log(`[Cache MISS] Fetching from upstream: ${url.toString()}`);
-
   const apiUrl = new URL(apiBaseUrl);
   url.searchParams.forEach((value, key) => {
-    if (key === "target" || key === "callback" || key === "s" || key === "nocache") {
-      return;
-    }
+    if (["target", "callback", "s", "nocache"].includes(key)) return;
     apiUrl.searchParams.set(key, value);
   });
 
   if (!apiUrl.searchParams.has("types")) {
-    return new Response("Missing types", { status: 400 });
+    return jsonResponse({ error: "missing_types" }, 400);
   }
 
-  const upstream = await fetch(apiUrl.toString(), {
-    headers: {
-      "User-Agent": "Meting/1.5.0",
-      "Accept": "application/json",
-    },
-  });
+  let upstream: Response;
+  try {
+    upstream = await fetch(apiUrl.toString(), {
+      method: "GET",
+      headers: {
+        "User-Agent": "Meting/1.5.0",
+        "Accept": "application/json",
+      },
+    });
+  } catch (error) {
+    console.error("[GD Studio Fetch Error]", error);
+    return jsonResponse({ error: "upstream_fetch_failed" }, 502);
+  }
 
-  const responseBuffer = await upstream.arrayBuffer();
-const responseText = new TextDecoder("utf-8").decode(responseBuffer);
+  let responseText = "";
+  try {
+    responseText = await upstream.text();
+  } catch (error) {
+    console.error("[GD Studio Read Error]", error);
+    return jsonResponse({ error: "upstream_read_failed", upstreamStatus: upstream.status }, 502);
+  }
+
+  const parsed = parseApiJson(responseText);
+  if (!upstream.ok || !parsed.valid) {
+    console.error("[GD Studio Invalid Response]", {
+      status: upstream.status,
+      reason: parsed.reason,
+      preview: responseText.slice(0, 160),
+    });
+    return jsonResponse(
+      {
+        error: "music_api_upstream_error",
+        reason: parsed.reason ?? "upstream_http_error",
+        upstreamStatus: upstream.status,
+      },
+      502,
+      upstream.headers,
+    );
+  }
+
   const headers = createCorsHeaders(upstream.headers);
-headers.set("Content-Type", "application/json; charset=utf-8");
-  if (!headers.has("Content-Type")) {
-    headers.set("Content-Type", "application/json; charset=utf-8");
-  }
-
+  headers.set("Content-Type", "application/json; charset=utf-8");
   headers.set("X-Cache-Status", "MISS");
   headers.set("Access-Control-Expose-Headers", "X-Cache-Status");
 
-  // 判断是否应该缓存：必须是 200 状态，且内容不能是空数组或包含错误标识，且未指定强制刷新
   const isSearch = url.searchParams.get("types") === "search";
-  const isEmptyResult = responseText.trim() === "[]";
-  const isError = responseText.includes('"error"') || responseText.includes('"status":0');
-  
-  let shouldCache = upstream.status === 200 && request.method === "GET" && !isError && !bypassCache;
-  
-  // 如果是搜索请求且结果为空，通常是 API 繁忙或异常，不建议长缓存
-  if (isSearch && isEmptyResult) {
-    shouldCache = false;
-  }
+  const isEmptySearchResult = isSearch && Array.isArray(parsed.value) && parsed.value.length === 0;
+  const shouldCache = isGet && upstream.status === 200 && !isEmptySearchResult && !bypassCache;
 
-  if (shouldCache) {
-    headers.set("Cache-Control", "public, s-maxage=300, max-age=300");
-  } else {
-    headers.set("Cache-Control", "no-store, no-cache, must-revalidate");
-  }
+  headers.set(
+    "Cache-Control",
+    shouldCache ? "public, s-maxage=300, max-age=300" : "no-store, no-cache, must-revalidate",
+  );
 
-  const response = new Response(responseText, {
-    status: upstream.status,
-    statusText: upstream.statusText,
+  const response = new Response(request.method === "HEAD" ? null : responseText, {
+    status: 200,
     headers,
   });
 
-  // 写入缓存（不阻塞主流程）
-  if (shouldCache && waitUntil) {
-    waitUntil(cache.put(cacheKey, response.clone()));
+  if (shouldCache) {
+    const cacheResponse = new Response(responseText, {
+      status: 200,
+      headers: new Headers(headers),
+    });
+    const putPromise = cache.put(cacheKey, cacheResponse).catch((error) => {
+      console.warn(`[Cache PUT ERROR] ${url.toString()}`, error);
+    });
+    if (waitUntil) waitUntil(putPromise);
+    else await putPromise;
     console.log(`[Cache PUT] Saved to cache: ${url.toString()}`);
   }
 
   return response;
 }
 
-export async function onRequest({ request, waitUntil, env }: { request: Request, waitUntil: (promise: Promise<any>) => void, env: any }): Promise<Response> {
-  // 优先使用环境变量中配置的 API 地址，CF 部署未设置时 fallback 到默认节点
-  const apiBaseUrl = (typeof env?.API_BASE_URL === "string" && env.API_BASE_URL) ? env.API_BASE_URL : DEFAULT_API_BASE_URL;
-  if (request.method === "OPTIONS") {
-    return handleOptions();
-  }
+export async function onRequest({
+  request,
+  waitUntil,
+  env,
+}: {
+  request: Request;
+  waitUntil?: (promise: Promise<any>) => void;
+  env: any;
+}): Promise<Response> {
+  if (request.method === "OPTIONS") return handleOptions();
 
   if (request.method !== "GET" && request.method !== "HEAD") {
-    return new Response("Method not allowed", { status: 405 });
+    return new Response("Method not allowed", {
+      status: 405,
+      headers: createCorsHeaders(undefined, "no-store"),
+    });
   }
 
-  const url = new URL(request.url);
-  const target = url.searchParams.get("target");
+  try {
+    const apiBaseUrl =
+      typeof env?.API_BASE_URL === "string" && env.API_BASE_URL.trim()
+        ? env.API_BASE_URL.trim()
+        : DEFAULT_API_BASE_URL;
+    const url = new URL(request.url);
+    const target = url.searchParams.get("target");
 
-  if (target) {
-    return proxyKuwoAudio(target, request);
+    if (target) return await proxyKuwoAudio(target, request);
+    return await proxyApiRequest({ request, waitUntil, apiBaseUrl }, url);
+  } catch (error) {
+    console.error("[Lunatide Proxy Unhandled Error]", error);
+    return jsonResponse({ error: "proxy_internal_error" }, 500);
   }
-
-  return proxyApiRequest(url, request, waitUntil, apiBaseUrl);
 }
