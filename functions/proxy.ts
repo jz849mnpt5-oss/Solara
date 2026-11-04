@@ -1,4 +1,6 @@
 const DEFAULT_API_BASE_URL = "https://music-api.gdstudio.xyz/api.php";
+const FALLBACK_BROWSER_UA =
+  "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
 const KUWO_HOST_PATTERN = /(^|\.)kuwo\.cn$/i;
 const SAFE_RESPONSE_HEADERS = [
   "content-type",
@@ -208,18 +210,58 @@ async function proxyApiRequest({ request, waitUntil, apiBaseUrl }: ProxyContext,
     return jsonResponse({ error: "upstream_read_failed", upstreamStatus: upstream.status }, 502);
   }
 
-  const parsed = parseApiJson(responseText);
+  let parsed = parseApiJson(responseText);
+  const attempts: Array<Record<string, unknown>> = [];
+  let usedFallbackUa = false;
+  if (!upstream.ok || !parsed.valid) {
+    attempts.push({
+      ua: "Meting/1.5.0",
+      status: upstream.status,
+      reason: parsed.reason ?? "upstream_http_error",
+      preview: responseText.slice(0, 200),
+    });
+    // 第一次失败：换成常见浏览器身份再试一次（排查上游是否拒绝 Meting 身份）
+    try {
+      const retry = await fetch(apiUrl.toString(), {
+        method: "GET",
+        headers: {
+          "User-Agent": FALLBACK_BROWSER_UA,
+          "Accept": "application/json, text/plain, */*",
+        },
+      });
+      const retryText = await retry.text();
+      const retryParsed = parseApiJson(retryText);
+      if (retry.ok && retryParsed.valid) {
+        upstream = retry;
+        responseText = retryText;
+        parsed = retryParsed;
+        usedFallbackUa = true;
+      } else {
+        attempts.push({
+          ua: "browser",
+          status: retry.status,
+          reason: retryParsed.reason ?? "upstream_http_error",
+          preview: retryText.slice(0, 200),
+        });
+      }
+    } catch (retryError) {
+      attempts.push({ ua: "browser", error: String(retryError).slice(0, 120) });
+    }
+  }
+
   if (!upstream.ok || !parsed.valid) {
     console.error("[GD Studio Invalid Response]", {
       status: upstream.status,
       reason: parsed.reason,
-      preview: responseText.slice(0, 160),
+      attempts,
     });
     return jsonResponse(
       {
         error: "music_api_upstream_error",
         reason: parsed.reason ?? "upstream_http_error",
         upstreamStatus: upstream.status,
+        forwarded: apiUrl.search.slice(0, 200),
+        attempts,
       },
       502,
       upstream.headers,
@@ -229,7 +271,8 @@ async function proxyApiRequest({ request, waitUntil, apiBaseUrl }: ProxyContext,
   const headers = createCorsHeaders(upstream.headers);
   headers.set("Content-Type", "application/json; charset=utf-8");
   headers.set("X-Cache-Status", "MISS");
-  headers.set("Access-Control-Expose-Headers", "X-Cache-Status");
+  if (usedFallbackUa) headers.set("X-Upstream-UA", "browser-fallback");
+  headers.set("Access-Control-Expose-Headers", "X-Cache-Status, X-Upstream-UA");
 
   const isSearch = url.searchParams.get("types") === "search";
   const isEmptySearchResult = isSearch && Array.isArray(parsed.value) && parsed.value.length === 0;
